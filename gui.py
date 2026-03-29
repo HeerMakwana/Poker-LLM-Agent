@@ -67,6 +67,11 @@ class PokerGUI(tk.Tk):
         self.opponent_labels = ["Opponent 1"]
         self.phase = "pre_game"
         self._updating_position_ui = False
+        
+        # Opponent state tracking
+        self.opponent_states = {}  # {opp_name: {"folded": bool, "contributed": amount}}
+        self.current_opponent_index = 0
+        self.player_has_acted_this_street = False
 
         self._build_styles()
         self._build_ui()
@@ -284,6 +289,54 @@ class PokerGUI(tk.Tk):
 
     def _on_position_var_change(self, *_args) -> None:
         self._update_position_details()
+
+    def _init_opponent_states(self) -> None:
+        """Initialize opponent state tracking for the hand."""
+        self.opponent_states = {}
+        for label in self.opponent_labels:
+            self.opponent_states[label] = {"folded": False, "contributed": 0, "acted_this_street": False}
+        self.current_opponent_index = 0
+        self.player_has_acted_this_street = False
+
+    def _reset_opponent_acted_flags(self) -> None:
+        for opp_name in self.opponent_states:
+            self.opponent_states[opp_name]["acted_this_street"] = False
+
+    def _all_active_opponents_acted(self) -> bool:
+        active = [name for name, state in self.opponent_states.items() if not state.get("folded", False)]
+        if not active:
+            return True
+        return all(self.opponent_states[name].get("acted_this_street", False) for name in active)
+
+    def _get_next_active_opponent(self) -> str | None:
+        """Get the next opponent who has not acted this street and has not folded."""
+        start_idx = self.current_opponent_index
+        for i in range(len(self.opponent_labels)):
+            idx = (start_idx + i) % len(self.opponent_labels)
+            opp_name = self.opponent_labels[idx]
+            opp_state = self.opponent_states.get(opp_name, {})
+            if not opp_state.get("folded", False) and not opp_state.get("acted_this_street", False):
+                self.current_opponent_index = idx
+                return opp_name
+        return None
+
+    def _is_betting_round_complete(self) -> bool:
+        """Check if all opponents have acted and amounts match or are all-in."""
+        # Count unfolded opponents
+        unfolded = [o for o in self.opponent_labels if not self.opponent_states[o].get("folded", False)]
+        if len(unfolded) == 0:
+            return True  # Everyone folded
+        
+        # Check if player acted this street
+        if not self.player_has_acted_this_street:
+            return False
+        
+        # All unfolded opponents should have matched the bet or be all-in
+        max_bet = max(self.opponent_states[o].get("contributed", 0) for o in unfolded)
+        for opp_name in unfolded:
+            if self.opponent_states[opp_name].get("contributed", 0) != max_bet:
+                return False
+        return True
 
     def _on_controls_canvas_configure(self, event) -> None:
         self.controls_canvas.itemconfigure(self.controls_canvas_window, width=event.width)
@@ -570,7 +623,6 @@ class PokerGUI(tk.Tk):
     def _update_ui_state(self) -> None:
         pre = self.phase == "pre_game"
         opponent_turn = self.phase == "opponent_action"
-        ai_turn = self.phase == "ai_decision"
         player_turn = self.phase == "player_action"
         street_ready = self.phase == "street_ready"
 
@@ -581,12 +633,35 @@ class PokerGUI(tk.Tk):
         self._set_enabled(self.initial_pot_entry, pre)
         self._set_enabled(self.start_btn, pre)
 
+        # Auto-set next opponent and provide instruction
+        if opponent_turn:
+            if self._all_active_opponents_acted():
+                if self.player_has_acted_this_street:
+                    self.amount_to_call = 0
+                    self.phase = "street_ready"
+                    self._set_ai_text("All opponents have responded. Betting round complete.")
+                    self._log("Betting round complete.")
+                else:
+                    self.phase = "player_action"
+                    self._set_ai_text("All opponents have acted. Your turn.\nClick 'Get AI Suggestion' for recommendation.")
+                self._update_ui_state()
+                return
+            next_opp = self._get_next_active_opponent()
+            if next_opp:
+                self.opp_player_var.set(next_opp)
+                self._set_ai_text(f"Waiting for {next_opp}'s action.\nAmount to call: ${self.amount_to_call}")
+            else:
+                self.phase = "player_action"
+                self._set_ai_text("All opponents have acted. Your turn!\nClick 'Get AI Suggestion' for recommendation.")
+                self._update_ui_state()
+                return
+
         self._set_enabled(self.opp_player_combo, opponent_turn)
         self._set_enabled(self.opp_combo, opponent_turn)
         self._set_enabled(self.opp_amount_entry, opponent_turn)
         self._set_enabled(self.process_opp_btn, opponent_turn)
 
-        self._set_enabled(self.ask_ai_btn, ai_turn)
+        self._set_enabled(self.ask_ai_btn, player_turn)
 
         self._set_enabled(self.check_btn, player_turn and self.amount_to_call == 0)
         self._set_enabled(self.call_btn, player_turn and self.amount_to_call > 0)
@@ -654,6 +729,7 @@ class PokerGUI(tk.Tk):
             self.raise_var.set(0)
             self.opp_amount_var.set(0)
             self._refresh_opponent_selector()
+            self._init_opponent_states()
             self._set_ai_text("Waiting for opponent action.")
             mode_text = "blind mode" if self.play_blind else "normal mode"
             self._log(f"Started hand #{self.hand_number} ({mode_text}) as {self.my_position} with {self.num_players} players.")
@@ -680,20 +756,39 @@ class PokerGUI(tk.Tk):
             messagebox.showerror("Opponent Action", "Amount cannot be negative")
             return
 
+        opp_state = self.opponent_states.get(opponent_name, {"folded": False, "contributed": 0})
+
         if action == "Fold":
-            self.my_stack += self.pot_size
+            opp_state["folded"] = True
+            opp_state["acted_this_street"] = True
+            self.opponent_states[opponent_name] = opp_state
+            unfolded_count = sum(1 for o in self.opponent_states.values() if not o.get("folded", False))
+            if unfolded_count == 0:
+                self.my_stack += self.pot_size
+                self._log(f"{opponent_name} folded. You win ${self.pot_size}.")
+                self._end_hand("All opponents folded. Start a new hand.")
+                return
             self.last_opponent_action = f"{opponent_name} folded."
             self.opponent_history.append(self.last_opponent_action)
-            self._log(f"{opponent_name} folded. You win ${self.pot_size}.")
-            self._end_hand("Opponent folded. Start a new hand.")
+            self._log(self.last_opponent_action)
+            # Move to next opponent
+            self.current_opponent_index = (self.current_opponent_index + 1) % len(self.opponent_labels)
+            self.phase = "opponent_action"
+            self._update_ui_state()
             return
 
         if action == "Check":
-            self.amount_to_call = 0
+            if self.amount_to_call > 0:
+                messagebox.showerror("Opponent Action", "Cannot check when there is an amount to call")
+                return
+            opp_state["acted_this_street"] = True
+            self.opponent_states[opponent_name] = opp_state
             self.last_opponent_action = f"{opponent_name} checked."
             self.opponent_history.append(self.last_opponent_action)
-            self.phase = "ai_decision"
             self._log(self.last_opponent_action)
+            # Move to next opponent
+            self.current_opponent_index = (self.current_opponent_index + 1) % len(self.opponent_labels)
+            self.phase = "opponent_action"
             self._update_ui_state()
             return
 
@@ -702,11 +797,15 @@ class PokerGUI(tk.Tk):
                 messagebox.showerror("Opponent Action", f"Call amount must be at least ${self.amount_to_call}")
                 return
             self.pot_size += amount
-            self.amount_to_call = 0
+            opp_state["contributed"] = self.opponent_states[opponent_name].get("contributed", 0) + amount
+            opp_state["acted_this_street"] = True
+            self.opponent_states[opponent_name] = opp_state
             self.last_opponent_action = f"{opponent_name} called ${amount}."
             self.opponent_history.append(self.last_opponent_action)
-            self.phase = "street_ready"
             self._log(f"{self.last_opponent_action} Pot is now ${self.pot_size}.")
+            # Move to next opponent or player
+            self.current_opponent_index = (self.current_opponent_index + 1) % len(self.opponent_labels)
+            self.phase = "opponent_action"
             self._update_ui_state()
             return
 
@@ -715,16 +814,22 @@ class PokerGUI(tk.Tk):
                 messagebox.showerror("Opponent Action", f"Raise must be greater than ${self.amount_to_call}")
                 return
             self.pot_size += amount
+            opp_state["contributed"] = self.opponent_states[opponent_name].get("contributed", 0) + amount
+            opp_state["acted_this_street"] = True
+            self.opponent_states[opponent_name] = opp_state
             self.amount_to_call = amount
             self.last_opponent_action = f"{opponent_name} raised to ${amount}."
             self.opponent_history.append(self.last_opponent_action)
-            self.phase = "ai_decision"
             self._log(f"{self.last_opponent_action} Pot is now ${self.pot_size}.")
+            self.player_has_acted_this_street = False  # Reset player action since new bet
+            # Move to next opponent to respond to raise
+            self.current_opponent_index = (self.current_opponent_index + 1) % len(self.opponent_labels)
+            self.phase = "opponent_action"
             self._update_ui_state()
             return
 
     def get_ai_decision(self) -> None:
-        if self.phase != "ai_decision":
+        if self.phase != "player_action":
             return
 
         decision = self.agent.get_action(self._current_state_for_ai())
@@ -734,15 +839,16 @@ class PokerGUI(tk.Tk):
 
         self._set_ai_text(f"Action: {action}\nRaise To: ${raise_amount}\nReason: {reasoning}")
         self._log(f"AI suggests: {action} (raise to ${raise_amount}).")
-        self.phase = "player_action"
         self._update_ui_state()
 
     def apply_player_action(self, action: str) -> None:
         if self.phase != "player_action":
             return
 
+        self.player_has_acted_this_street = True
+
         if action == "FOLD":
-            self._log(f"You folded. Opponent wins ${self.pot_size}.")
+            self._log(f"You folded. Opponents win ${self.pot_size}.")
             self._end_hand("You folded. Start a new hand.")
             return
 
@@ -750,15 +856,17 @@ class PokerGUI(tk.Tk):
             if self.amount_to_call > 0:
                 messagebox.showerror("Player Action", "Cannot check when there is an amount to call")
                 return
-            self.phase = "street_ready"
             self._log("You checked.")
+            self.phase = "street_ready"
+            self._log("Betting round complete.")
             self._update_ui_state()
             return
 
         if action == "CALL":
             if self.amount_to_call <= 0:
-                self.phase = "street_ready"
                 self._log("Nothing to call. Treated as check.")
+                self.phase = "street_ready"
+                self._log("Betting round complete.")
                 self._update_ui_state()
                 return
             if self.my_stack < self.amount_to_call:
@@ -769,6 +877,7 @@ class PokerGUI(tk.Tk):
             self._log(f"You called ${self.amount_to_call}. Pot is now ${self.pot_size}.")
             self.amount_to_call = 0
             self.phase = "street_ready"
+            self._log("Betting round complete.")
             self._update_ui_state()
             return
 
@@ -788,8 +897,11 @@ class PokerGUI(tk.Tk):
             self.my_stack -= raise_to
             self.pot_size += raise_to
             self.amount_to_call = raise_to
-            self.phase = "opponent_action"
             self._log(f"You raised to ${raise_to}. Pot is now ${self.pot_size}.")
+            self.player_has_acted_this_street = True
+            self._reset_opponent_acted_flags()
+            self.phase = "opponent_action"
+            self.current_opponent_index = 0
             self._update_ui_state()
             return
 
@@ -801,8 +913,11 @@ class PokerGUI(tk.Tk):
             self.my_stack = 0
             self.pot_size += allin
             self.amount_to_call = allin
-            self.phase = "opponent_action"
             self._log(f"You went all-in for ${allin}. Pot is now ${self.pot_size}.")
+            self.player_has_acted_this_street = True
+            self._reset_opponent_acted_flags()
+            self.phase = "opponent_action"
+            self.current_opponent_index = 0
             self._update_ui_state()
             return
 
@@ -832,9 +947,15 @@ class PokerGUI(tk.Tk):
         self.community_cards.extend(cards)
         self.community_var.set("")
         self.amount_to_call = 0
+        self.player_has_acted_this_street = False
         self.last_opponent_action = "No actions yet on this street."
         self.opponent_history.append(f"Street moved to {street.title()}.")
+        # Reset opponent contributions for new street
+        for opp_name in self.opponent_states:
+            self.opponent_states[opp_name]["contributed"] = 0
+        self._reset_opponent_acted_flags()
         self.current_street += 1
+        self.current_opponent_index = 0
         self.phase = "opponent_action"
         self._log(f"Dealt {street}. Community: {' '.join(self.community_cards)}")
         self._update_ui_state()
@@ -853,6 +974,9 @@ class PokerGUI(tk.Tk):
         self.community_cards = []
         self.hole_cards = []
         self.opponent_history = []
+        self.opponent_states = {}
+        self.current_opponent_index = 0
+        self.player_has_acted_this_street = False
         self.play_blind = bool(self.play_blind_var.get())
         self.community_var.set("")
         self.raise_var.set(0)
